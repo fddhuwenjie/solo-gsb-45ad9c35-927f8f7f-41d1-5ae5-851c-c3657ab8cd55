@@ -1478,3 +1478,308 @@ class RevocationReviewResult(BaseModel):
                     "signer not uniquely bindable, indirect/delta CRL, or "
                     "unparseable blob), sorted by (kind, source_index).",
     )
+
+
+# ---------------------------------------------------------------------------
+# /deployments/policy-review: certificate purpose (CA/keyUsage/EKU) and
+# path-length (basicConstraints) policy review of both current and target
+# chains at one validation instant
+# ---------------------------------------------------------------------------
+
+MAX_POLICY_SKEW_SECONDS = 300
+
+# Well-known extended key usages callers may require (dotted OIDs are always
+# accepted too; these aliases are normalized before validation).
+EKU_ALIASES = {
+    "serverAuth": "1.3.6.1.5.5.7.3.1",
+    "clientAuth": "1.3.6.1.5.5.7.3.2",
+    "codeSigning": "1.3.6.1.5.5.7.3.3",
+    "emailProtection": "1.3.6.1.5.5.7.3.4",
+    "timeStamping": "1.3.6.1.5.5.7.3.8",
+    "OCSPSigning": "1.3.6.1.5.5.7.3.9",
+}
+
+
+class PolicyReviewEndpoint(BaseModel):
+    """An endpoint whose current/target leaves are reviewed for TLS purpose."""
+
+    endpoint_id: str = Field(..., min_length=1)
+    current_leaf_fingerprint: str = Field(
+        ...,
+        min_length=64,
+        description="SHA-256 fingerprint (hex, case-insensitive) of the leaf "
+                    "currently served, as in /scenarios/normalize.",
+    )
+    target_leaf_fingerprint: str = Field(
+        ...,
+        min_length=64,
+        description="SHA-256 fingerprint (hex, case-insensitive) of the leaf "
+                    "that will be served after the rotation.",
+    )
+    role: Literal["server", "client"] = Field(
+        ...,
+        description="TLS role of this endpoint's leaves: 'server' requires "
+                    "id-kp-serverAuth and server-side KeyUsage bits; 'client' "
+                    "requires id-kp-clientAuth and client-side bits.",
+    )
+    required_eku: list[str] = Field(
+        default_factory=list,
+        description="Additional extended key usages the leaf must carry "
+                    "(dotted OIDs, or the aliases serverAuth/clientAuth/"
+                    "codeSigning/emailProtection/timeStamping/OCSPSigning). "
+                    "The EKU implied by the role is always required as well.",
+    )
+
+
+class PolicyReviewRequest(BaseModel):
+    """Validity / basicConstraints / keyUsage / EKU review of both chains."""
+
+    pem_certificates: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Unordered PEM bag; same parsing/deduplication rules as "
+                    "/scenarios/normalize. Must contain every endpoint's "
+                    "current and target leaves, their intermediates and the "
+                    "declared trust roots.",
+    )
+    trust_roots: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Self-signed root fingerprints allowed to terminate a "
+                    "reconstructed chain.",
+    )
+    endpoints: list[PolicyReviewEndpoint] = Field(..., min_length=1)
+    check_time: datetime = Field(
+        ...,
+        description="Validation instant (ISO-8601; naive datetimes are "
+                    "treated as UTC). Every certificate of both chains must "
+                    "be within its validity period at this exact instant.",
+    )
+    max_skew_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_POLICY_SKEW_SECONDS,
+        description="Clock skew tolerance in seconds applied to the "
+                    "notBefore/notAfter windows; at most 300.",
+    )
+
+    @field_validator("check_time")
+    @classmethod
+    def _check_time_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _unique_endpoints(self) -> "PolicyReviewRequest":
+        ids = [e.endpoint_id for e in self.endpoints]
+        if len(set(ids)) != len(ids):
+            raise ValueError("endpoints: endpoint_id values must be unique")
+        return self
+
+
+# Per-position reasons, in the precedence order used as the endpoint's first
+# conflicting rule and as the stable violation sort order (position first,
+# then this order):
+#
+# certificate_not_yet_valid / certificate_expired
+#   check_time outside the certificate's [notBefore, notAfter] window.
+# not_a_ca / basic_constraints_missing
+#   an intermediate/anchor lacks CA:TRUE, or a non-leaf certificate omits the
+#   critical basicConstraints extension entirely.
+# path_len_constraint_violated
+#   a CA's pathLenConstraint cannot cover the non-self-issued intermediates
+#   below it in this chain.
+# ca_missing_key_cert_sign
+#   a CA certificate carries KeyUsage without keyCertSign.
+# leaf_is_ca / leaf_key_usage_invalid
+#   the leaf asserts CA:TRUE, or its KeyUsage lacks the bits the TLS role
+#   requires (server: digitalSignature or keyEncipherment; client:
+#   digitalSignature or keyAgreement).
+# eku_missing
+#   the leaf's extKeyUsage omits the role EKU or a caller-required EKU.
+# unknown_critical_extension
+#   a non-anchor certificate carries a critical extension the policy engine
+#   does not recognize (the trust anchor itself is not constrained here).
+PolicyViolationReason = Literal[
+    "certificate_not_yet_valid",
+    "certificate_expired",
+    "not_a_ca",
+    "basic_constraints_missing",
+    "path_len_constraint_violated",
+    "ca_missing_key_cert_sign",
+    "leaf_is_ca",
+    "leaf_key_usage_invalid",
+    "eku_missing",
+    "unknown_critical_extension",
+]
+
+# Chain/endpoint rollups additionally allow "ok".
+PolicyChainReason = Literal[
+    "ok",
+    "certificate_not_yet_valid",
+    "certificate_expired",
+    "not_a_ca",
+    "basic_constraints_missing",
+    "path_len_constraint_violated",
+    "ca_missing_key_cert_sign",
+    "leaf_is_ca",
+    "leaf_key_usage_invalid",
+    "eku_missing",
+    "unknown_critical_extension",
+]
+
+POLICY_REASON_ORDER = {
+    "certificate_not_yet_valid": 0,
+    "certificate_expired": 1,
+    "not_a_ca": 2,
+    "basic_constraints_missing": 3,
+    "path_len_constraint_violated": 4,
+    "ca_missing_key_cert_sign": 5,
+    "leaf_is_ca": 6,
+    "leaf_key_usage_invalid": 7,
+    "eku_missing": 8,
+    "unknown_critical_extension": 9,
+}
+
+
+class PolicyViolation(BaseModel):
+    """One machine-readable rule conflict found at one chain position.
+
+    Sorted stably in every response: first by chain position (leaf = 0),
+    then by reason precedence, then by the remaining fields.
+    """
+
+    position: int = Field(
+        ...,
+        description="0-based chain position this violation was found at "
+                    "(0 = leaf).",
+    )
+    certificate_fingerprint: str
+    role: Literal["leaf", "intermediate", "trust_root"]
+    reason: PolicyViolationReason
+    message: str
+    not_valid_before: Optional[datetime] = Field(
+        ..., description="Certificate notBefore (UTC); null only when unparseable.",
+    )
+    not_valid_after: Optional[datetime] = Field(
+        ..., description="Certificate notAfter (UTC); null only when unparseable.",
+    )
+    is_ca: Optional[bool] = Field(
+        ...,
+        description="basicConstraints cA value; null when the extension is "
+                    "absent or cannot be decoded.",
+    )
+    path_len: Optional[int] = Field(
+        ...,
+        description="basicConstraints pathLenConstraint; null when absent.",
+    )
+    key_usage: Optional[list[str]] = Field(
+        ...,
+        description="Asserted KeyUsage bit names (digital_signature, "
+                    "key_encipherment, key_cert_sign, ...); null when the "
+                    "extension is absent.",
+    )
+    eku: Optional[list[str]] = Field(
+        ...,
+        description="ExtKeyUsageSyntax OIDs carried by the certificate; null "
+                    "when the extension is absent (an absent EKU means no EKU "
+                    "restriction for a CA, but fails a leaf's role/required "
+                    "EKU checks).",
+    )
+    extension_oid: Optional[str] = Field(
+        ...,
+        description="OID responsible: the unrecognized critical extension's "
+        "dotted OID for unknown_critical_extension, else null.",
+    )
+    required_eku: Optional[list[str]] = Field(
+        ...,
+        description="For eku_missing at a leaf, the normalized set of OIDs "
+        "required there (role EKU plus caller-required EKUs); null otherwise.",
+    )
+
+
+class PolicyChainReview(BaseModel):
+    """Policy verdict for one (endpoint, current|target) reconstructed chain."""
+
+    chain_role: Literal["current", "target"]
+    eligible: bool = Field(
+        ...,
+        description="True iff every participating certificate passes: "
+                    "validity at check_time; basicConstraints CA/pathLen and "
+                    "(when KeyUsage is present) keyCertSign for issuers; "
+                    "leaf KeyUsage/EKU matching the endpoint role and the "
+                    "caller-required EKUs; no unknown critical extension on "
+                    "any non-anchor certificate.",
+    )
+    reason: PolicyChainReason = Field(
+        ...,
+        description="First conflicting rule in (position, precedence) order; "
+                    "'ok' when the chain is compliant.",
+    )
+    chain: list[str] = Field(
+        ...,
+        description="Cryptographically verified leaf-first fingerprint chain "
+                    "from the leaf to a declared trust root.",
+    )
+    violations: list[PolicyViolation] = Field(
+        ...,
+        description="All conflicts found, sorted by (position, reason, ...).",
+    )
+
+
+class EndpointPolicyResult(BaseModel):
+    endpoint_id: str
+    role: Literal["server", "client"]
+    required_eku: list[str] = Field(
+        ...,
+        description="Normalized OIDs the leaf must carry: the role EKU plus "
+                    "the caller-required EKUs, sorted and de-duplicated.",
+    )
+    current_leaf_fingerprint: str
+    target_leaf_fingerprint: str
+    eligible: bool = Field(
+        ...,
+        description="True iff BOTH chains are compliant. A non-compliant "
+                    "current or target chain must never be released; only an "
+                    "eligible endpoint's target chain is safe to hand to "
+                    "/plans.",
+    )
+    reason: PolicyChainReason = Field(
+        ...,
+        description="First conflicting rule across both chains (current "
+                    "before target, then position/precedence); 'ok' when both "
+                    "chains are compliant.",
+    )
+    violating_chain: Optional[Literal["current", "target"]] = Field(
+        ...,
+        description="Which chain the first conflicting rule belongs to; "
+                    "null when both chains are compliant.",
+    )
+    current_chain: PolicyChainReview
+    target_chain: PolicyChainReview
+
+
+class PolicyReviewResult(BaseModel):
+    check_time: datetime
+    max_skew_seconds: int
+    results: list[EndpointPolicyResult] = Field(
+        ...,
+        description="Per-endpoint verdicts, stably sorted by endpoint_id. "
+                    "Every participating certificate of both chains is listed "
+                    "inside the chain reviews even when a chain is "
+                    "ineligible, so a failure needs no second round trip.",
+    )
+
+
+class PolicyEkuIssue(BaseModel):
+    endpoint_id: str
+    index: int = Field(
+        ..., description="Index of the bad entry in the endpoint's required_eku.",
+    )
+    eku: str
+    message: str
+
+
+class PolicyErrorDetail(NormalizeErrorDetail):
+    policy_issues: list[PolicyEkuIssue] = Field(default_factory=list)

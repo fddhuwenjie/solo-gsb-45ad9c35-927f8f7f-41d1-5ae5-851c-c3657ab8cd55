@@ -37,6 +37,9 @@ from .models import (
     ReplanFailure,
     ReplanRequest,
     ReplanSuccess,
+    PolicyErrorDetail,
+    PolicyReviewRequest,
+    PolicyReviewResult,
     RevocationReviewRequest,
     RevocationReviewResult,
     VariantSelectionErrorDetail,
@@ -46,6 +49,7 @@ from .models import (
 )
 from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
+from .policy import policy_review
 from .precheck import precheck_identities
 from .reconcile import reconcile
 from .replan import replan
@@ -59,6 +63,10 @@ class _NormalizeErrorResponse(BaseModel):
 
 class _PrecheckErrorResponse(BaseModel):
     detail: PrecheckErrorDetail
+
+
+class _PolicyErrorResponse(BaseModel):
+    detail: PolicyErrorDetail
 
 
 class _VariantSelectionErrorResponse(BaseModel):
@@ -82,9 +90,11 @@ async def _scenario_validation_handler(_request, exc: ScenarioValidationError):
 
 
 @app.exception_handler(NormalizeError)
-async def _normalize_error_handler(request, exc: NormalizeError):    # Both /scenarios/normalize and /deployments/precheck raise NormalizeError
-    # (shared PEM/fingerprint/chain diagnostics); only the pre-check carries
-    # identity_issues, so shape the detail per route.
+async def _normalize_error_handler(request, exc: NormalizeError):    # /scenarios/normalize, /deployments/precheck, /deployments/revocation-review
+    # and /deployments/policy-review all raise NormalizeError (shared
+    # PEM/fingerprint/chain diagnostics); only the pre-check carries
+    # identity_issues and only the policy review carries policy_issues, so
+    # shape the detail per route.
     if request.url.path.startswith("/deployments/precheck"):
         detail = PrecheckErrorDetail(
             error=exc.error,
@@ -93,6 +103,15 @@ async def _normalize_error_handler(request, exc: NormalizeError):    # Both /sce
             fingerprint_issues=exc.fingerprint_issues,
             chain_issues=exc.chain_issues,
             identity_issues=getattr(exc, "identity_issues", []),
+        )
+    elif request.url.path.startswith("/deployments/policy-review"):
+        detail = PolicyErrorDetail(
+            error=exc.error,
+            message=exc.message,
+            pem_issues=exc.pem_issues,
+            fingerprint_issues=exc.fingerprint_issues,
+            chain_issues=exc.chain_issues,
+            policy_issues=getattr(exc, "policy_issues", []),
         )
     else:
         detail = NormalizeErrorDetail(
@@ -339,13 +358,51 @@ def revocation_review_deployment(req: RevocationReviewRequest) -> Any:
 
 
 @app.post(
+    "/deployments/policy-review",
+    response_model=PolicyReviewResult,
+    responses={422: {"model": _PolicyErrorResponse}},
+    summary="Review certificate purpose (CA/keyUsage/EKU) and path-length "
+            "policy of current and target chains",
+)
+def policy_review_deployment(req: PolicyReviewRequest) -> Any:
+    """Reconstruct each endpoint's current *and* target leaf-first chains
+    with the same signature verification and exact zero/unique/ambiguous
+    path verdict as /scenarios/normalize, then audit every participating
+    certificate at the request's check_time.
+
+    Every certificate (trust anchor included) must be within its validity
+    period (widened by max_skew_seconds, at most 300). At every level
+    basicConstraints is enforced: leaves must not be CAs, issuers must be
+    CAs with keyCertSign in KeyUsage when KeyUsage is present, and each
+    CA's pathLenConstraint must cover the non-self-issued intermediate CAs
+    below it in this chain. The leaf's KeyUsage must permit the declared
+    TLS role (server: digitalSignature or keyEncipherment; client:
+    digitalSignature or keyAgreement) and its EKU must contain the role
+    EKU (id-kp-serverAuth/id-kp-clientAuth) plus every caller-required EKU
+    (anyExtendedKeyUsage satisfies all). Any unrecognized *critical*
+    extension on the leaf or an intermediate fails closed; the trust
+    anchor's own extensions do not constrain path processing.
+
+    An endpoint is eligible only when BOTH its current and its target
+    chain are compliant — a non-compliant current or target chain is never
+    released. Results are sorted by endpoint_id; each lists every
+    participating certificate of both chains, the first conflicting rule
+    (current chain before target, then chain position and reason
+    precedence) and all machine-readable violations. Only an eligible
+    endpoint's target chain is safe to hand to /plans. A chain that cannot
+    be resolved uniquely returns a structured 422 (no_trust_path /
+    ambiguous_chain).
+    """
+    return policy_review(req)
+
+
+@app.post(
     "/deployments/variants",
     response_model=VariantSelectionResult,
     responses={
         409: {"model": VariantSelectionConflict},
         422: {"model": _VariantSelectionErrorResponse},
-    },
-    summary="Select the minimum set of certificate variants covering every "
+    },    summary="Select the minimum set of certificate variants covering every "
             "heterogeneous client",
 )
 def select_deployment_variants(req: VariantSelectionRequest) -> Any:

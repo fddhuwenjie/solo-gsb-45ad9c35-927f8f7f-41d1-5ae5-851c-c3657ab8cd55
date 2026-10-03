@@ -11,6 +11,13 @@
 当前链与每端点候选替代链的离线撤销证据，重算阶段最少的安全续策。
 另提供**部署身份预检**：在规划前校验目标叶证书的 SAN 是否覆盖端点声明的
 DNS/IP 身份，并沿链累计中间 CA 的名称约束（excluded 优先、permitted 取交集）。
+还有**证书用途与路径策略审查**：一次提交 PEM 包、信任根指纹与各端点当前/目标
+叶指纹及其 TLS 角色（server/client）和所需 EKU，服务复用签名链归一化同时重建
+当前、目标两条链，在统一校验时刻核对每张证书的有效期、逐级
+BasicConstraints/pathLen 与 CA/keyCertSign、叶 KeyUsage/EKU 及未知关键扩展；
+当前链或目标链任一不合规即不放行，按端点稳定列出参与证书、首个冲突规则与
+机器可读原因，只有两条链均合格的目标链可交给 `/plans`，无唯一路径返回
+结构化 422。
 以及 **OCSP 装订响应离线预检**：不上网、不连响应器，直接校验端点将装订的
 OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 good 且在有效期内。
 还有**证书变体选择**：给定每个端点最多 12 条候选指纹链与异构客户端各自的
@@ -409,6 +416,105 @@ curl -s http://localhost:8080/deployments/revocation-review \
 可用 `examples/gen_revocation_review_example.py` 重新生成（窗口 2024–2035、
 `check_time` 固定为 2030-01-01；其中一个端点是良好全 good，另一个端点的叶被
 中间 CA 的新鲜 CRL 撤销，另有一个增量 CRL 演示不支持路径）。
+
+### `POST /deployments/policy-review` — 证书用途与路径策略审查（当前链 + 目标链）
+
+在把目标链交给规划器之前，统一审查端点**当前链与目标链**在同一校验时刻的
+证书用途与路径策略。调用方提交与归一化接口相同的 PEM 包（同样的解析、去重、
+签名验证与唯一链重建规则——多条信任路径仍按 `ambiguous_chain` 返回 422）、
+允许的信任根指纹，以及每个端点的当前/目标叶指纹、TLS 角色（`server` 或
+`client`）和所需扩展密钥用途（EKU）：
+
+```bash
+curl -s http://localhost:8080/deployments/policy-review \
+  -H 'Content-Type: application/json' \
+  --data @examples/policy_review_request.json
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pem_certificates` / `trust_roots` | 与 `/scenarios/normalize` 相同；包需含当前/目标叶、全部中间证书与信任根 |
+| `endpoints[].current_leaf_fingerprint` / `target_leaf_fingerprint` | 端点当前/目标叶的 SHA-256（大小写不敏感）；`endpoint_id` 不得重复 |
+| `endpoints[].role` | 叶证书的 TLS 角色：`server`（要求 id-kp-serverAuth）或 `client`（要求 id-kp-clientAuth） |
+| `endpoints[].required_eku` | 叶证书必须携带的额外 EKU，点分 OID 或别名 `serverAuth`/`clientAuth`/`codeSigning`/`emailProtection`/`timeStamping`/`OCSPSigning`；角色隐含的 EKU 始终强制 |
+| `check_time` | 统一校验时刻（ISO-8601；裸时间按 UTC）。两条链的每张证书都必须在该时刻处于有效期 |
+| `max_skew_seconds` | 作用于 notBefore/notAfter 的时钟偏差秒数，**最多 300**，缺省 0 |
+
+每条重建链（叶在前）按以下规则逐级审查：
+
+- **有效期**：含信任根在内的每张证书都必须满足
+  `notBefore − skew ≤ check_time ≤ notAfter + skew`；过早为
+  `certificate_not_yet_valid`，过期为 `certificate_expired`。
+- **BasicConstraints 逐级检查**：叶证书不得断言 `cA:TRUE`
+  （`leaf_is_ca`；叶上缺省 basicConstraints 按 RFC 5280 视为非 CA，合法）；
+  每张中间证书必须携带 `cA:TRUE` 的 basicConstraints——扩展缺失为
+  `basic_constraints_missing`、存在但为 `cA:FALSE` 为 `not_a_ca`；信任根
+  同样必须是 CA。
+- **pathLenConstraint**：某个 CA 的 `pathLenConstraint` 必须不小于本链中位于
+  它**下方的非自签发中间 CA 数**（subject == issuer 的自签发证书不计数，
+  按 RFC 5280 §4.2.1.9），否则 `path_len_constraint_violated`。
+- **CA / keyCertSign**：签发者携带 KeyUsage 时必须含 `keyCertSign`
+  （无 KeyUsage 扩展不强制），否则 `ca_missing_key_cert_sign`。
+- **叶 KeyUsage 匹配角色**：KeyUsage 缺省不限制；server 叶须有
+  `digitalSignature` 或 `keyEncipherment`，client 叶须有 `digitalSignature`
+  或 `keyAgreement`，否则 `leaf_key_usage_invalid`。
+- **叶 EKU**：叶的 extKeyUsage 必须包含角色 EKU 与全部 `required_eku`；
+  `anyExtendedKeyUsage`（2.5.29.37.0）可满足任意 EKU；EKU 扩展缺失视为不
+  证明任何用途，返回 `eku_missing`。
+- **未知关键扩展**：叶或中间证书上出现策略引擎无法识别的 **critical**
+  扩展时失败关闭为 `unknown_critical_extension`（直接从证书 DER 枚举
+  `(OID, critical)`，cryptography 无法建模的扩展也不会漏检）；**信任根自身
+  的扩展不约束路径校验**，按 RFC 5280 豁免。
+
+**当前链或目标链任一不合规，端点即 `eligible: false`，不得放行**；只有两条链
+都合规的端点，其目标链才可交给 `/plans`。成功返回 `200`，`results` 按
+`endpoint_id` 稳定排序；每个结果给出归一化后的 `required_eku`、
+`violating_chain`（首个冲突属于哪条链）、跨链的首个冲突规则 `reason`
+（当前链优先于目标链，链内按「位置升序、reason 优先级」选取），以及两条链
+各自参与证书的完整 `chain` 与**全部**冲突 `violations`（每条含链位置、证书
+指纹、is_ca/path_len/key_usage/eku 上下文与人类可读 `message`）：
+
+```json
+{
+  "check_time": "2030-01-01T00:00:00Z",
+  "max_skew_seconds": 0,
+  "results": [
+    {
+      "endpoint_id": "api.example.com",
+      "role": "server",
+      "required_eku": ["1.3.6.1.5.5.7.3.1"],
+      "current_leaf_fingerprint": "1a2b...",
+      "target_leaf_fingerprint": "4e82...",
+      "eligible": true,
+      "reason": "ok",
+      "violating_chain": null,
+      "current_chain": {"chain_role": "current", "eligible": true,
+                        "reason": "ok", "chain": ["1a2b...", "0d38..."],
+                        "violations": []},
+      "target_chain": {"chain_role": "target", "eligible": true,
+                       "reason": "ok", "chain": ["4e82...", "951a..."],
+                       "violations": []}
+    }
+  ]
+}
+```
+
+`reason` 优先级（同为链级/端点级首个冲突的稳定裁决序）：
+`certificate_not_yet_valid` → `certificate_expired` → `not_a_ca` →
+`basic_constraints_missing` → `path_len_constraint_violated` →
+`ca_missing_key_cert_sign` → `leaf_is_ca` → `leaf_key_usage_invalid` →
+`eku_missing` → `unknown_critical_extension`。
+
+请求级错误返回结构化 `422`，`detail` 与归一化接口同构（`error`、`message`、
+`pem_issues` / `fingerprint_issues` / `chain_issues`），另提供 `policy_issues`
+（非法 EKU，错误码 `invalid_eku`，定位到端点与下标）；链无法唯一解析时同样
+返回 `no_trust_path` / `ambiguous_chain`。示例见
+[`examples/policy_review_request.json`](examples/policy_review_request.json)，
+可用 `examples/gen_policy_review_example.py` 重新生成：其中一个端点当前/目标链
+均合格，其余三个分别演示角色/EKU 冲突（server 角色但只有 clientAuth）、路径
+长度冲突（pathLen=0 的根下仍有一张中间 CA）与未知关键扩展冲突。
 
 ### `POST /deployments/variants` — 异构客户端最小证书变体选择
 
