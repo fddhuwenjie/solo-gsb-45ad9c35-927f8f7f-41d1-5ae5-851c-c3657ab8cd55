@@ -27,6 +27,9 @@ from .models import (
     PlannedStage,
     PlanRequest,
     PlanSuccess,
+    PolicyReviewErrorDetail,
+    PolicyReviewRequest,
+    PolicyReviewResult,
     PrecheckErrorDetail,
     PrecheckRequest,
     PrecheckResult,
@@ -46,6 +49,7 @@ from .models import (
 )
 from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
+from .policy import policy_review
 from .precheck import precheck_identities
 from .reconcile import reconcile
 from .replan import replan
@@ -59,6 +63,10 @@ class _NormalizeErrorResponse(BaseModel):
 
 class _PrecheckErrorResponse(BaseModel):
     detail: PrecheckErrorDetail
+
+
+class _PolicyReviewErrorResponse(BaseModel):
+    detail: PolicyReviewErrorDetail
 
 
 class _VariantSelectionErrorResponse(BaseModel):
@@ -93,6 +101,15 @@ async def _normalize_error_handler(request, exc: NormalizeError):    # Both /sce
             fingerprint_issues=exc.fingerprint_issues,
             chain_issues=exc.chain_issues,
             identity_issues=getattr(exc, "identity_issues", []),
+        )
+    elif request.url.path.startswith("/deployments/policy-review"):
+        detail = PolicyReviewErrorDetail(
+            error=exc.error,
+            message=exc.message,
+            pem_issues=exc.pem_issues,
+            fingerprint_issues=exc.fingerprint_issues,
+            chain_issues=exc.chain_issues,
+            eku_issues=getattr(exc, "eku_issues", []),
         )
     else:
         detail = NormalizeErrorDetail(
@@ -336,6 +353,43 @@ def revocation_review_deployment(req: RevocationReviewRequest) -> Any:
     Eligible endpoints' ``chain`` is ready to hand to /plans.
     """
     return revocation_review(req)
+
+
+@app.post(
+    "/deployments/policy-review",
+    response_model=PolicyReviewResult,
+    responses={422: {"model": _PolicyReviewErrorResponse}},
+    summary="Review certificate purpose and path policy for current/target chains",
+)
+def policy_review_deployment(req: PolicyReviewRequest) -> Any:
+    """Audit both the currently served and the target chain of every endpoint
+    against RFC 5280 path policy before planning a rotation.
+
+    Both chains are reconstructed from the PEM bundle with the same
+    signature-verification machinery as /scenarios/normalize (issuance edges
+    by real signature verification; a leaf must have exactly one path to a
+    declared trust root or the request fails with the structured 422 used by
+    every /deployments route). At ``check_time`` every certificate of each
+    chain — including the trust anchor — must be within its validity period;
+    every CA-position certificate must carry basicConstraints with cA=TRUE
+    and a pathLenConstraint large enough for the non-self-issued
+    intermediates below it, and a KeyUsage extension (when present) must
+    assert keyCertSign; the leaf must not be marked a CA, its KeyUsage must
+    fit the TLS role and it must assert the role EKU
+    (id-kp-serverAuth/id-kp-clientAuth) plus every caller-supplied required
+    EKU (intermediate EKUs chain-restrict the leaf; anyExtendedKeyUsage
+    satisfies all purposes); every unrecognized critical extension fails
+    closed.
+
+    Results are sorted by endpoint_id; each entry lists every participating
+    certificate (chain order, with BasicConstraints/pathLen/KeyUsage/EKU and
+    critical-extension metadata), the full stably ordered conflict list and
+    the first conflicting rule. An endpoint is eligible only when BOTH its
+    current and its target chain comply — an endpoint whose current chain is
+    already non-compliant at check_time is not passed through — and only the
+    eligible target chain (its ``chain`` list) should be handed to /plans.
+    """
+    return policy_review(req)
 
 
 @app.post(

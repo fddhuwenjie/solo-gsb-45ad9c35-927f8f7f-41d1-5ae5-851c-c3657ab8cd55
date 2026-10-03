@@ -63,6 +63,7 @@ class NormalizeError(ValueError):
         fingerprint_issues: Optional[list[NormalizeFingerprintIssue]] = None,
         chain_issues: Optional[list[NormalizeChainIssue]] = None,
         identity_issues: Optional[list] = None,
+        eku_issues: Optional[list] = None,
     ) -> None:
         super().__init__(message)
         self.error = error
@@ -71,6 +72,7 @@ class NormalizeError(ValueError):
         self.fingerprint_issues = fingerprint_issues or []
         self.chain_issues = chain_issues or []
         self.identity_issues = identity_issues or []
+        self.eku_issues = eku_issues or []
 
 
 # ---------------------------------------------------------------------------
